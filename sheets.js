@@ -378,6 +378,7 @@ function updateInventoryForSheet(sheet) {
 
 function updateAllSheets() {
   const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  clearApiCache();
 
 
   Logger.log(`Starting update for ${sheets.length} sheets`);
