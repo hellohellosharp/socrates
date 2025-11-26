@@ -5,7 +5,7 @@ function onOpen() {
     .addToUi();
 }
 
-const apiCache = {};
+let apiCache = {};
 function getApiWithCache(url) {
   if (apiCache[url]) {
     return apiCache[url];
