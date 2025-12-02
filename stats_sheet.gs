@@ -59,9 +59,9 @@ function processStatLevelsSheet(sheet) {
 
   // Base columns
   const COL_PLAYER_NAME = colIndex["Player Name"];
-  const COL_PLAYER_ID   = colIndex["Player ID"];
-  const COL_TOTAL_LVL   = colIndex["Total Lvl"];
-  const COL_TOTAL_EXP   = colIndex["Total Exp"];
+  const COL_PLAYER_ID = colIndex["Player ID"];
+  const COL_TOTAL_LVL = colIndex["Total Lvl"];
+  const COL_TOTAL_EXP = colIndex["Total Exp"];
 
   // Map skillName → column index if column exists
   const skillColumns = {};
@@ -123,11 +123,31 @@ function processStatLevelsSheet(sheet) {
         }
       }
 
-      // Write totals if columns exist
+      // Write totals
       if (COL_TOTAL_EXP) sheet.getRange(userRow, COL_TOTAL_EXP).setValue(totalExp);
       if (COL_TOTAL_LVL) sheet.getRange(userRow, COL_TOTAL_LVL).setValue(totalLvl);
 
-      Logger.log(`✅ Row ${userRow}: Updated stats for playerId=${playerId}, user="${usernameCellValue}"`);
+      // --- Collect latest data for history sheet ---
+      const latest = {
+        "Player Name": player.username,
+        "Player ID": playerId,
+        "Total Exp": totalExp,
+        "Total Lvl": totalLvl
+      };
+
+      // Add each skill column
+      for (const skillId in skillMap) {
+        const skillName = skillMap[skillId].name;
+        const col = skillColumns[skillName];
+        if (col) {
+          latest[skillName] = sheet.getRange(userRow, col).getValue();
+        }
+      }
+
+      // --- Update Levels History ---
+      updateLevelsHistory(sheet, latest);
+
+      Logger.log(`✅ Row ${userRow}: Updated stats + history check for playerId=${playerId}`);
 
     } catch (e) {
       Logger.log(`❌ Row ${userRow}: Error processing stats for playerId=${playerId} – ${e}`);
@@ -135,4 +155,184 @@ function processStatLevelsSheet(sheet) {
   }
 
   Logger.log(`✅ Finished processing stat/levels sheet: ${sheet.getName()}`);
+}
+
+/**
+ * Appends a new row to "Levels History" if any skill level changed.
+ *
+ * Behaviour:
+ * - If no previous history row for this player: writes a baseline row, no bold.
+ * - If previous row exists: only appends if at least one skill level changed.
+ * - Only skill columns drive change detection (not Player Name / ID / Date).
+ * - Bold = only the skill columns whose level changed.
+ *
+ * @param {Sheet} statsSheet – the stats sheet being processed (e.g. "Levels")
+ * @param {Object} latest    – map of headerName -> latest value for that row
+ */
+function updateLevelsHistory(statsSheet, latest) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const history = ss.getSheetByName("Levels History");
+  if (!history) {
+    Logger.log("📘 No 'Levels History' sheet found. Skipping history logging.");
+    return;
+  }
+
+  Logger.log(`🕑 Checking Level History updates for ${statsSheet.getName()}`);
+
+  // ===========================
+  // 1) Build header index map
+  // ===========================
+  const headerRow = history.getRange(1, 1, 1, history.getLastColumn()).getValues()[0];
+  const hIndex = {};
+
+  headerRow.forEach((h, i) => {
+    const trimmed = String(h || "").trim();
+    if (!trimmed) return;
+
+    const colNumber = i + 1;
+    hIndex[trimmed] = colNumber;
+
+    // Allow shorthand headers in the history sheet as well
+    if (typeof STAT_HEADER_SHORTHANDS !== "undefined" && STAT_HEADER_SHORTHANDS[trimmed]) {
+      const canonical = STAT_HEADER_SHORTHANDS[trimmed]; // e.g. Leatherwork -> Leatherworking
+      hIndex[canonical] = colNumber;
+    }
+  });
+
+  const playerId = latest["Player ID"];
+  if (!playerId) {
+    Logger.log("⚠ Missing Player ID in latest row, skipping history update.");
+    return;
+  }
+
+  // Build a set of skill names from skillMap so we only treat these as "levels"
+  const skillNames = new Set(Object.values(skillMap).map(s => s.name));
+
+  // ===========================
+  // 2) Read existing history rows safely
+  // ===========================
+  let allHistoryRows = [];
+  const lastRow = history.getLastRow();
+
+  if (lastRow > 1) {
+    allHistoryRows = history.getRange(
+      2,                      // start row
+      1,                      // start col
+      lastRow - 1,            // number of rows
+      history.getLastColumn()
+    ).getValues();
+  }
+
+  // ===========================
+  // 3) Find last entry for this player
+  // ===========================
+  let lastRowData = null;
+  const playerIdCol = hIndex["Player ID"];
+  if (playerIdCol && allHistoryRows.length > 0) {
+    for (let r = allHistoryRows.length - 1; r >= 0; r--) {
+      const pid = String(allHistoryRows[r][playerIdCol - 1] || "").trim();
+      if (pid === String(playerId)) {
+        lastRowData = allHistoryRows[r];
+        break;
+      }
+    }
+  }
+
+  // ===========================
+  // 4) Compare: detect changed skill columns
+  // ===========================
+  let hasChange = false;
+  const changedColumns = {}; // canonical header name → true
+
+  if (!lastRowData) {
+    // No previous row for this player:
+    // we want a baseline row, but with NOTHING bold.
+    hasChange = true;
+    Logger.log(`📘 No existing history for player ${playerId}. Writing baseline row (no bold).`);
+  } else {
+    for (const key in latest) {
+      if (!hIndex[key]) continue;          // skip headers that don't exist in history
+      if (!skillNames.has(key)) continue;  // Only treat skills as "levels"
+
+      const colIdx = hIndex[key] - 1;
+      const newVal = latest[key];
+      const prevVal = lastRowData[colIdx];
+
+      if (String(newVal) !== String(prevVal)) {
+        changedColumns[key] = true;
+        hasChange = true;
+      }
+    }
+  }
+
+  if (!hasChange) {
+    Logger.log(`📘 No level changes for player ${playerId}. No history row added.`);
+    return;
+  }
+
+  // ===========================
+  // 5) Build new row in history header order
+  // ===========================
+  const newRow = headerRow.map((rawHeader) => {
+    const headerName = String(rawHeader || "").trim();
+
+    if (headerName === "Date") {
+      // Use the sheet's configured timezone
+      const tz = Session.getScriptTimeZone();
+      return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm");
+    }
+    if (headerName === "Unix") {
+      return Math.floor(Date.now() / 1000);
+    }
+
+    // Direct match first
+    if (latest[headerName] !== undefined) {
+      return latest[headerName];
+    }
+
+    // If header is a shorthand, use its canonical in 'latest'
+    if (typeof STAT_HEADER_SHORTHANDS !== "undefined") {
+      const canonical = STAT_HEADER_SHORTHANDS[headerName];
+      if (canonical && latest[canonical] !== undefined) {
+        return latest[canonical];
+      }
+    }
+
+    return "";
+  });
+
+  const appendRowIndex = history.getLastRow() + 1;
+  history.getRange(appendRowIndex, 1, 1, newRow.length).setValues([newRow]);
+
+  // ===========================
+  // 6) Apply bold formatting ONLY to changed skill columns
+  // ===========================
+  headerRow.forEach((rawHeader, index) => {
+    const headerName = String(rawHeader || "").trim();
+    const cell = history.getRange(appendRowIndex, index + 1);
+
+    // Never bold these:
+    if (
+      headerName === "Player Name" ||
+      headerName === "Player ID" ||
+      headerName === "Date"
+    ) {
+      cell.setFontWeight("normal");
+      return;
+    }
+
+    // Work in canonical name space for changedColumns
+    let canonical = headerName;
+    if (typeof STAT_HEADER_SHORTHANDS !== "undefined" && STAT_HEADER_SHORTHANDS[headerName]) {
+      canonical = STAT_HEADER_SHORTHANDS[headerName];
+    }
+
+    if (changedColumns[canonical] && skillNames.has(canonical)) {
+      cell.setFontWeight("bold");
+    } else {
+      cell.setFontWeight("normal");
+    }
+  });
+
+  Logger.log(`📘 Levels History updated at row ${appendRowIndex} for Player ID ${playerId}`);
 }
